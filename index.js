@@ -4,6 +4,11 @@ const crypto = require('crypto');
 const { Octokit } = require('@octokit/rest');
 const fs = require('fs');
 const jwt = require('jsonwebtoken');
+const OpenAI = require('openai');
+
+const openai = new OpenAI({
+    apiKey: process.env.OPENAI_API_KEY,
+});
 
 const app = express();
 app.use(express.raw({ type: 'application/json' }));
@@ -20,6 +25,12 @@ function createJWT() {
     const privateKey = process.env.GITHUB_PRIVATE_KEY.replace(/\\n/g, '\n');
 
     return jwt.sign(payload, privateKey, { algorithm: 'RS256' });
+}
+
+
+function isCodeFile(filename) {
+    const imageExtensions = ['.png', '.jpg', '.jpeg', '.gif', '.svg', '.ico', '.bmp', '.webp'];
+    return !imageExtensions.some(ext => filename.toLowerCase().endsWith(ext));
 }
 
 // Get installation access token
@@ -75,6 +86,90 @@ app.post('/webhook', async (req, res) => {
     }
 });
 
+async function reviewFileWithAI(file, octokit, repository, prNumber) {
+    try {
+        console.log('Reviewing file:', file.filename);
+
+        // get ai review for the changes
+        const aiReview = await getAIReview(file.filename, file.patch);
+
+        if (aiReview.comments && aiReview.comments.length > 0) {
+            for (const comment of aiReview.comments) {
+                await postInlineComment(octokit, repository, prNumber, file, comment);
+            }
+        }
+    } catch (error) {
+        console.error('Error reviewing file:', error);
+    }
+}
+
+async function getAIReview(filename, patch) {
+    const prompt = `Review this code change and provide specific feedback. Focus on:
+- Potential bugs or issues
+- Code quality improvements
+- Security concerns
+- Performance issues
+- Best practices
+
+File: ${filename}
+Changes:
+${patch}
+
+Respond in JSON format:
+{
+  "comments": [
+    {
+      "line": <line_number>,
+      "message": "<specific feedback>",
+      "severity": "error|warning|suggestion"
+    }
+  ]
+}
+
+Only include comments for lines that actually need improvement. If no issues found, return {"comments": []}.`;
+
+    try {
+        const response = await openai.chat.completions.create({
+            model: "gpt-3.5-turbo",
+            messages: [{ role: "user", content: prompt }],
+            temperature: 0.1,
+            max_tokens: 1000
+        });
+
+        const content = response.choices[0].message.content;
+        return JSON.parse(content);
+    } catch (error) {
+        console.error('AI review error:', error);
+        return { comments: [] };
+    }
+}
+
+async function postInlineComment(octokit, repository, prNumber, file, comment) {
+    try {
+        // First, let's get the commit SHA for the PR
+        const { data: prData } = await octokit.rest.pulls.get({
+            owner: repository.owner.login,
+            repo: repository.name,
+            pull_number: prNumber,
+        });
+
+        await octokit.rest.pulls.createReviewComment({
+            owner: repository.owner.login,
+            repo: repository.name,
+            pull_number: prNumber,
+            body: `🤖 **${comment.severity.toUpperCase()}**: ${comment.message}`,
+            commit_id: prData.head.sha,  // Required: commit SHA
+            path: file.filename,
+            position: comment.line,      // Changed from 'line' to 'position'
+        });
+
+        console.log(`Posted inline comment on ${file.filename}:${comment.line}`);
+    } catch (error) {
+        console.error('Error posting inline comment:', error.message);
+    }
+}
+
+
 async function handlePullRequest(payload) {
     const { pull_request, installation, repository } = payload;
 
@@ -88,6 +183,17 @@ async function handlePullRequest(payload) {
         repo: repository.name,
         pull_number: pull_request.number,
     });
+
+    // Process each file for AI review 
+
+    for (const file of files) {
+        if (file.status === 'removed' || !file.patch) continue;
+
+        // Only review non image files
+        if (isCodeFile(file.filename)) {
+            await reviewFileWithAI(file, octokit, repository, pull_request.number);
+        }
+    }
 
     // Count lines
     const stats = countLines(files);

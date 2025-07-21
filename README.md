@@ -50,7 +50,7 @@ WEBHOOK_SECRET=your_webhook_secret
 
 `node index.js`
 Use a tunneling service like:
-`npx localtunnel --port 3000 --subdomain pr-line-bot`
+`npx localtunnel --port 3000 --subdomain ghapptest123`
 
 ## Github app setup 
 
